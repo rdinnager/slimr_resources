@@ -1,0 +1,1960 @@
+---
+title: "Getting Started with slimr"
+output: learnr::tutorial
+runtime: shiny_prerendered
+---
+
+```{r setup, include=FALSE}
+library(learnr)
+knitr::opts_chunk$set(echo = TRUE, comment = "",
+                      error = TRUE,
+                      fig.width = 7,
+                      fig.height = 6,
+                      out.width = "80%")
+```
+
+```{r color, echo = FALSE, results='asis'}
+# crayon needs to be explicitly activated in Rmd
+options(crayon.enabled = TRUE)
+# Hooks needs to be set to deal with outputs
+# thanks to fansi logic
+if(requireNamespace("fansi", quietly = TRUE)) {
+  old_hooks <- fansi::set_knit_hooks(knitr::knit_hooks, 
+                                     which = c("output", "message", "error"))
+}
+```
+
+
+## Let's get started
+
+Before you can use `slimr` for population genomics simulations you will need to install the package as well as the SLiM software which it depends on. For the purposes of this tutorial SLiM and slimr have been preinstalled, so you can get started immediately. However, if you want to install it on your own system, the `slim_setup()` function in `slimr` will attempt to install a platform-appropriate version of SLiM automatically.
+Since `slimr` is not yet on CRAN, you will have to install it from github using the `devtools` package like this: `devtools::install_github("rdinnager/slimr")`.
+
+```{r load_slimr}
+library(slimr)
+```
+
+Here are all the packages we will use throughout this tutorial. We will also set a random seed so that anytime this document is run we should get the same results.
+
+```{r load_libs, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(ape)
+library(paletteer)
+library(mapview)
+library(purrr)
+library(gifski)
+library(fastcluster)
+library(NLMR)
+library(raster)
+library(imager)
+library(ggquiver)
+library(tidyr)
+library(gganimate)
+library(dartR)
+library(dendextend)
+library(gdistance)
+library(directlabels)
+
+seed <- 121212
+set.seed(seed)
+```
+
+## Simple Example: Two Subpopulations Evolving through Time
+
+We will start with a very simple example, and go through a typical workflow for creating a new simulation. 
+
+This is one step by step way to approach it:
+
+1. Sketch out the processes and logic of the simulation you want to conduct (e.g. do we want migration between populations? Should it vary in time?)
+2. Covert your logic into code using the SLiM language embedded in R with `slimr`
+3. Decide what should be changeable:
+  + Decide what parameters of the simulation you want to be able to change (e.g. what are your knobs?)
+  + What starting conditions should I try (more knobs)?
+  + Add `slimr` verbs to make parameters and starting conditions easily changeable from R
+4. Decide what information you want to get out of the simulation?
+  + Add `slimr` verbs to your simulation to output useful information.
+5. Try your simulation with some parameter choices and visualise your results.
+6. Debug as necessary.
+7. Run your full analysis
+  + Use `slimr` to setup many runs (in paralell) with different parameters for:
+    - Sensitivity analysis
+    - Fitting to data (e.g. with Approximate Bayesian Computation -- ABC)
+
+So, let's try to make a simulation. Here is our setup: We have two subpopulation of and organism, which may or may not be connected through some migration. These subpopulation have diploid genomes that are evolving through neutral process (e.g. genetic drift). These subpopulations will reproduce through mating, and we want to track any evolutionary changes in the genome through time. The following is code to produce such a simulation. We will go through this example line by line in a moment. This simulation is very similar to the [first example from the SLiM manual](http://benhaller.com/slim/SLiM_Manual.pdf#page=78) (on page 78). You can look at that example to see the similarities and differences between specifying a model directly in SLiM, and specifying it in `slimr`.
+
+```{r basic_example}
+sim <- slim_script(
+  
+  slim_block(initialize(), {
+    ## initialise global 'stuff'
+    ## initialize mutation rate
+    initializeMutationRate(1e-7)
+    ## initialize mutation types
+    initializeMutationType("m1", 0.5, "f", 0.0)
+    ## initialise mutation genomic element types
+    initializeGenomicElementType("g1", m1, 1.0)
+    ## initialise genomic elements
+    initializeGenomicElement(g1, 0, 100000 - 1)
+    ## initialise recombination rates
+    initializeRecombinationRate(1e-8)
+  }),
+  
+  slim_block(1, {
+    ## setup populations and other stuff in first generation
+    sim%.%SLiMSim$addSubpop("p1", 100)
+    sim%.%SLiMSim$addSubpop("p2", 100)
+    ## set migration rates between populations
+    p1%.%Subpopulation$setMigrationRates(p2, 0.1)
+    p2%.%Subpopulation$setMigrationRates(p1, 0.1)
+  }),
+  
+  slim_block(100000, {
+    ## tell the simulation to finish
+    sim%.%SLiMSim$simulationFinished()
+  })
+)
+
+sim
+
+```
+
+That's it! Your first simple simulation. A `slim_script` call contructs a script from a set of code blocks, which are created using calls to `slim_block`. This one has three blocks, the first sets up the simulation (the `initialize()` block), the second block does something in generation 1 (setting up the subpopulations), and the third does something in generation 100000 (ending the simulation). When this is run, SLiM will use its default logic to simulate individuals and their genomes from generation 1 until the simulation is terminated. Migration will happen between the subpopulations automatically, mating will occur automatically too, as will mutations in the genome. Recombination will happen too. 
+
+By default, SLiM simulates diploid genomes with recombination, but we can change this using code. By default SLiM only tracks mutations in the genome (and doesn't simulated actual nucleotide changes, though, again, we can change this). By default mutations that fix in the whole population are removed for performance reason, but once again, we can change this so that SLiM keeps track of them. The general logic of the evolutionary processes that are simulated by default in SLiM are governed by the Wright-Fisher model (WF), which assumes each subpopulation has a constant population size, and that generations do not overlap, such that each generation replaces the previous generation, but higher fitness individuals are more likely to have their offspring to be represented. Again, SLiM has a `nonWF` mode that let's you relax all of these assumptions and create much more complex simulations (we will see an example much later).
+
+To run the simulation in R, we simply use the `slim_run` function from `slimr`. Assuming you have setup your SLiM software correctly and connected it to R, this will take care of the running of your simulation. Let's try it.
+
+```{r sim_run_1}
+
+sim_run <- slim_run(sim)
+
+```
+
+So that ran and gave an exit status of 0. That means the simulation worked and produced no errors. However, we don't have much of use now. This is because the simulation ran, but we didn't tell the simulation to produce anything. So our organisms migrated and mated, died and were born, all inside our computer, with no one watching. We can fix this by generating some output. This will use our first `slimr` verb. These are functions from `slimr` that can be inserted inside a SLiM based simulation that do useful things. In this case we will use `slim_output` to tell the simulation to capture some output and have it returned to R. So, one thing we might want to get out of this simulation is simply the genomes of the organisms at the end of the simulation. That is simple, we can do that like this:
+
+```{r basic_example2}
+
+sim <- slim_script(
+  
+  slim_block(initialize(), {
+    ## initialise global 'stuff'
+    ## initialize mutation rate
+    initializeMutationRate(1e-7)
+    ## initialize mutation types
+    initializeMutationType("m1", 0.5, "f", 0.0)
+    ## initialise mutation genomic element types
+    initializeGenomicElementType("g1", m1, 1.0)
+    ## initialise genomic elements
+    initializeGenomicElement(g1, 0, 100000 - 1)
+    ## initialise recombination rates
+    initializeRecombinationRate(1e-8)
+  }),
+  
+  slim_block(1, {
+    ## setup populations and other stuff in first generation
+    sim%.%SLiMSim$addSubpop("p1", 100)
+    sim%.%SLiMSim$addSubpop("p2", 100)
+    ## set migration rates between populations
+    p1%.%Subpopulation$setMigrationRates(p2, 0.01)
+    p2%.%Subpopulation$setMigrationRates(p1, 0.01)
+  }),
+  
+  slim_block(100000, {
+    ## output genome information
+    slimr_output(sim%.%SLiMSim$outputFull(), name = "full_output")
+    ## tell the simulation to finish
+    sim%.%SLiMSim$simulationFinished()
+  })
+)
+
+sim
+
+sim_run <- slim_run(sim)
+
+```
+
+Now we have some output data in the `output_data` element of the returned object. But it is not in too useful a form currently because it is just a character vector containing the entire dump produced by SLiM. This can be handy because it allows you to produced whatever custom output within SLiM you want, but the disadvantage is you need to figure out how to parse it from a character form yourself in R. There are many R functions that can help with this, in particular check out the `readr` and `stringr` packages. However, `slimr` has a number of helper function for importing the standard SLiM outputs into R in various useful formats. In this case, we can convert the `outputFull` output into a `genlight` object from the `adegenet` package, which is useful for SNP data. We do that like this.
+
+```{r genlight1}
+gl <- slim_output_genlight(sim_run)
+gl
+plot(gl)
+
+gl <- gl[order(pop(gl)), ]
+plot(gl)
+```
+
+So, how different are out populations? We can calculate a measure of population genomic differentiation pretty easily from a `genlight` using the `dartR` package.
+
+```{r calc_fst1}
+fst <- gl.fst.pop(gl, nboots = 1)
+fst
+```
+
+So that F~st~ value corresponds to roughly `r format(fst[2, 1] * 100, digits = 2)`% of the variation in the genome can be explained by the population structure. This variation must have been produced by genetic drift in each subpopulation, because they are mostly genetically isolated, with only 1% of their populations being exchanged each generation. Let's explore genetic differentiation using F~st~ further. Let's calculate it in each generation and see how it changes over time. For this we can use a very efficient F~st~ calculation function within SLiM itself called [calcFST](http://benhaller.com/slim/SLiM_Manual.pdf#page=583). But note this won't necessarily be directly comparable with the F~st~ from `dartR` because they use different implementations. calculating it every generation for 100,000 is probably extreme, so we can use the `do_every` argument of `slimr_output` to only output the calculation every 100 generations. Here's a new script:
+
+```{r basic_example3}
+sim_fst <- slim_script(
+  
+  slim_block(initialize(), {
+    ## initialise global 'stuff'
+    ## initialize mutation rate
+    initializeMutationRate(1e-7)
+    ## initialize mutation types
+    initializeMutationType("m1", 0.5, "f", 0.0)
+    ## initialise mutation genomic element types
+    initializeGenomicElementType("g1", m1, 1.0)
+    ## initialise genomic elements
+    initializeGenomicElement(g1, 0, 100000 - 1)
+    ## initialise recombination rates
+    initializeRecombinationRate(1e-8)
+  }),
+  
+  slim_block(1, {
+    ## setup populations and other stuff in first generation
+    sim%.%SLiMSim$addSubpop("p1", 100)
+    sim%.%SLiMSim$addSubpop("p2", 100)
+    ## set migration rates between populations
+    p1%.%Subpopulation$setMigrationRates(p2, 0.01)
+    p2%.%Subpopulation$setMigrationRates(p1, 0.01)
+  }),
+  
+  slim_block(1, 100000, late(), {
+    ## output Fst
+    slimr_output(calcFST(p1.genomes, p2.genomes), name = "fst",
+                 do_every = 100)
+  }),
+  
+  slim_block(100000, late(), {
+    ## tell the simulation to finish
+    sim%.%SLiMSim$simulationFinished()
+  })
+)
+
+sim_fst
+
+```
+
+Let's run that and see what we get.
+
+```{r run_sim_fst}
+fst_run <- slim_run(sim_fst)
+fst_run$output_data
+```
+
+We can try and convert that to useable data using the `slim_results_to_data()` function.
+
+```{r extract_fst}
+fst_dat <- slim_results_to_data(fst_run) %>%
+  mutate(fst = as.numeric(unlist(data)))
+fst_dat
+```
+
+Now we can plot it over time:
+
+```{r plot_1}
+ggplot(fst_dat, aes(generation, fst)) +
+  geom_path() +
+  geom_smooth(fill = "grey30", colour = "red") +
+  theme_minimal()
+```
+
+Looks like it has already settled into a bit of an equilibrium by generation 100 (our first F~st~ measurement), whereby F~st~ spikes up occasionally but generally stays around a low average value, as indicated by a lack of trend in the smooth red fitted line, and it hovering around `r format(mean(fst_dat$fst), digits = 2)`. But, what happens if we have no migration, or more migration? What happens if our populations start with different mutations? What if we increase or decrease equilibrium population size? We could just edit the code above, putting in new values on at a time and trying it, but that is pretty inefficient. What if we want to run a million simulations, all with different randomly drawn parameters? With `slimr`, that is simple. To do it we use another `slimr` verb, `slimr_template()`. This let's you insert 'templated' variables in a script, which can be filled in later with whatever you like. Let's setup one more script to use `slimr_template` for some of our simulation parameters.
+
+```{r basic_example4}
+
+sim_fst <- slim_script(
+  
+  slim_block(initialize(), {
+    ## initialise global 'stuff'
+    ## initialize mutation rate
+    initializeMutationRate(slimr_template("mut_rate", 1e-7))
+    ## initialize mutation types
+    initializeMutationType("m1", 0.5, "f", 0.0)
+    ## initialise mutation genomic element types
+    initializeGenomicElementType("g1", m1, 1.0)
+    ## initialise genomic elements
+    initializeGenomicElement(g1, 0, 100000 - 1)
+    ## initialise recombination rates
+    initializeRecombinationRate(1e-8)
+  }),
+  
+  slim_block(1, {
+    ## setup populations and other stuff in first generation
+    sim%.%SLiMSim$addSubpop("p1", slimr_template("pop_size", 100))
+    sim%.%SLiMSim$addSubpop("p2", ..pop_size..)
+    ## set migration rates between populations
+    p1%.%Subpopulation$setMigrationRates(p2, slimr_template("mig_rate", 0.01))
+    p2%.%Subpopulation$setMigrationRates(p1, ..mig_rate..)
+  }),
+  
+  slim_block(1, 100000, late(), {
+    ## output Fst
+    slimr_output(calcFST(p1.genomes, p2.genomes), name = "fst",
+                 do_every = 100)
+  }),
+  
+  slim_block(100000, late(), {
+    ## tell the simulation to finish
+    sim%.%SLiMSim$simulationFinished()
+  })
+)
+
+sim_fst
+
+```
+
+The first argument of `slimr_template` is the name of the templated variable you want to insert. You will use this name to refer to the variable later, when you want to replace it with a particular value. The second argument is the default value. If you don't specify a value for a templated variable later, when you "render" the script, the default value will be used. To insert values of your choice, use the `slimr_script_render()` function. This takes a `slimr_script` with templated variables, and a template (a list or data.frame with the name of variable to be replaced and their values). It is easiest to show this using an example. Let's make our simulation have zero migration between our populations and run it again.
+
+```{r first_template}
+sim_fst_zero <- slimr_script_render(sim_fst, template = list(mig_rate = 0))
+sim_fst_zero
+
+fst_zero_run <- slim_run(sim_fst_zero)
+
+fst_dat <- slim_results_to_data(fst_zero_run) %>%
+  mutate(fst = as.numeric(unlist(data)))
+
+ggplot(fst_dat, aes(generation, fst)) +
+  geom_path() +
+  geom_smooth(fill = "grey30", colour = "red") +
+  theme_minimal()
+
+```
+
+So there we have it. With no migration, F~st~ rapidly increases and eventually approaches 1, which is more or less complete differentiation. That means on average, each subpopulation has a unique set of mutations. This makes sense because mutations arise in each subpopulation separately, and have no way of spreading to the other subpopulation. The chances of the same mutation arising in both subpopulation is nearly nil. In fact it is nil in these simulations because by default SLiM treats all mutations as unique, even if by chance they are at the same position in the genome (this behaviour can of course be modified). Let's try reducing our population size:
+
+```{r first_template_lowpop}
+sim_fst_lowpop <- slimr_script_render(sim_fst, template = list(pop_size = 20))
+
+fst_lowpop_run <- slim_run(sim_fst_lowpop)
+
+fst_dat <- slim_results_to_data(fst_lowpop_run) %>%
+  mutate(fst = as.numeric(unlist(data)))
+
+ggplot(fst_dat, aes(generation, fst)) +
+  geom_path() +
+  geom_smooth(fill = "grey30", colour = "red") +
+  theme_minimal()
+
+```
+
+Again, we see rapid fluctuations of F~st~ but now hovering around an average of `r format(mean(fst_dat$fst), digits = 2)`, so a fair bit higher than the first simulation. This is expected since a lower population size creates stronger genetic drift, allowing the subpopulations to drift further apart. But the migration between subpopulations still generates enough gene flow to keep them from drifting apart further and further, like in the last scenario.
+
+You can try changing the values of the three parameters in the following code, then run it to see how the results change. To make it run faster we've also reduced how long the simulation runs using the `slim_script_change_duration()` function:
+
+```{r simple_sim_exercise, exercise = TRUE, echo = FALSE}
+sim_fst <- slim_script_duration(sim_fst, 10000)
+
+sim_fst_new <- slimr_script_render(sim_fst, 
+                                   template = list(mut_rate = 1e-7,
+                                                   pop_size = 100,
+                                                   mig_rate = 0.01))
+
+fst_new_run <- slim_run(sim_fst_new)
+
+fst_dat <- slim_results_to_data(fst_new_run) %>%
+  mutate(fst = as.numeric(unlist(data)))
+
+ggplot(fst_dat, aes(generation, fst)) +
+  geom_path() +
+  geom_smooth(fill = "grey30", colour = "red") +
+  theme_minimal()
+```
+
+It might be a little easier to play around with parameters using the following little app (note that the next release of `slimr` will have a function to automatically generate an app like this for your simulation).
+
+```{r shiny_app, echo = FALSE}
+numericInput("mut_rate", "Mutation Rate:", min = 1e-9, max = 1e-5, value = 1e-7)
+sliderInput("pop_size", "Population Size:", min = 5, max = 500, value = 100)
+numericInput("mig_rate", "Migration Rate:", min = 0.0, max = 1.0, value = 0.01)
+submitButton()
+plotOutput("fst_plot")
+```
+
+```{r shiny_server, context = "server"}
+library(slimr)
+
+sim_fst <- slim_script(
+  
+  slim_block(initialize(), {
+    ## initialise global 'stuff'
+    ## initialize mutation rate
+    initializeMutationRate(slimr_template("mut_rate", 1e-7))
+    ## initialize mutation types
+    initializeMutationType("m1", 0.5, "f", 0.0)
+    ## initialise mutation genomic element types
+    initializeGenomicElementType("g1", m1, 1.0)
+    ## initialise genomic elements
+    initializeGenomicElement(g1, 0, 100000 - 1)
+    ## initialise recombination rates
+    initializeRecombinationRate(1e-8)
+  }),
+  
+  slim_block(1, {
+    ## setup populations and other stuff in first generation
+    sim%.%SLiMSim$addSubpop("p1", slimr_template("pop_size", 100))
+    sim%.%SLiMSim$addSubpop("p2", ..pop_size..)
+    ## set migration rates between populations
+    p1%.%Subpopulation$setMigrationRates(p2, slimr_template("mig_rate", 0.01))
+    p2%.%Subpopulation$setMigrationRates(p1, ..mig_rate..)
+  }),
+  
+  slim_block(1, 10000, late(), {
+    ## output Fst
+    slimr_output(calcFST(p1.genomes, p2.genomes), name = "fst",
+                 do_every = 5)
+  }),
+  
+  slim_block(10000, late(), {
+    ## tell the simulation to finish
+    sim%.%SLiMSim$simulationFinished()
+  })
+)
+
+output$fst_plot <- renderPlot({
+  
+  sim_fst_new <- slimr_script_render(sim_fst, 
+                                   template = list(mut_rate = input$mut_rate,
+                                                   pop_size = input$pop_size,
+                                                   mig_rate = input$mig_rate))
+  
+  fst_new_run <- slim_run(sim_fst_new)
+
+  fst_dat <- slim_results_to_data(fst_new_run) %>%
+    mutate(fst = as.numeric(unlist(data)))
+  
+  ggplot(fst_dat, aes(generation, fst)) +
+    geom_path() +
+    geom_smooth(fill = "grey30", colour = "red") +
+    theme_minimal()
+})
+```
+
+The last thing we are going talk about using this simple example, is how to use `slimr_template` and `slimr_script_render` to generate many different versions of the same script and run them all at the same time (in sequence or in parallel). First, we generate a set of parameter values we want to try out. We will create a `data.frame` to store these values. We will try 12 different values to start.
+
+```{r generate_params}
+nvals <- 12
+params <- data.frame(mut_rate = runif(nvals, 1e-9, 1e-6),
+                     pop_size = ceiling(runif(nvals, 10, 100)),
+                     mig_rate = rbinom(nvals, 1, 0.5) * runif(nvals, 0, 0.5))
+
+params
+```
+
+Now we can use this `data.frame` to set up multiple scripts. These are returned as a `slimr_script_coll` object, which is essentially a collection of `slimr_script`s.
+
+```{r make_slimr_script_coll}
+## make duration a bit shorter to speed up individual simulations
+sim_fst <- slim_script_duration(sim_fst, 10000)
+many_scripts <- slimr_script_render(sim_fst, template = params)
+
+many_scripts
+```
+
+By default only the first three scripts are shown, but we can see that all twelve are there:
+
+```{r lengthit}
+length(many_scripts)
+```
+
+Running all of these simulations is as simple as calling `slim_run` on our collection object. This will run each simulation in sequence. However, it is much more efficient to run them in parallel. This can be accomplished automatically using the `future` package. Using `future` we setup our parallel workers, then use the argument `parallel = TRUE` in `slim_run`, which will tell `slim_run` to automatically use any available `future` workers. Using `future` is as simple as specifying a `future::plan`, see the help for that function to see what options are available. Here we will use `multisession` parallel workers.
+
+```{r parallel}
+future::plan(future::multisession(workers = 4))
+all_run <- slim_run(many_scripts, parallel = TRUE)
+length(all_run)
+class(all_run)
+```
+
+So now we have results for 12 separate runs of the simulation. We can extract our F~st~ values from each of these simulations and plot them together. Handy functions for this are found in the `purrr` package which allow for simple iteration over lists (which is what a `slimr_results_coll` is). Here we run our F~st~ extraction code on each element of the results and bind them together into a single `tibble`.
+
+```{r get_all_fst}
+all_fst <- imap_dfr(all_run, 
+                    ~ slim_results_to_data(.x) %>%
+                      mutate(fst = as.numeric(unlist(data)),
+                             rep = .y))
+
+all_fst
+
+```
+
+Now plot them:
+
+```{r plot_all}
+
+ggplot(all_fst, aes(generation, fst)) +
+    geom_path(aes(group = rep), alpha = 0.6) +
+    theme_minimal()
+
+```
+
+<!-- Here is another app that will let you run the above as many times as you want, adding each time to the plot: -->
+
+<!-- ```{r shiny_app2, echo = FALSE} -->
+<!-- actionButton("run", "Run 12 Simulations") -->
+<!-- plotOutput("fst_plot2") -->
+<!-- ``` -->
+
+<!-- ```{r shiny_server2, context = "server"} -->
+<!-- library(slimr) -->
+<!-- library(purrr) -->
+<!-- library(ggplot2) -->
+
+<!-- sim_fst <- slim_script( -->
+
+<!--   slim_block(initialize(), { -->
+<!--     ## initialise global 'stuff' -->
+<!--     ## initialize mutation rate -->
+<!--     initializeMutationRate(slimr_template("mut_rate", 1e-7)) -->
+<!--     ## initialize mutation types -->
+<!--     initializeMutationType("m1", 0.5, "f", 0.0) -->
+<!--     ## initialise mutation genomic element types -->
+<!--     initializeGenomicElementType("g1", m1, 1.0) -->
+<!--     ## initialise genomic elements -->
+<!--     initializeGenomicElement(g1, 0, 100000 - 1) -->
+<!--     ## initialise recombination rates -->
+<!--     initializeRecombinationRate(1e-8) -->
+<!--   }), -->
+
+<!--   slim_block(1, { -->
+<!--     ## setup populations and other stuff in first generation -->
+<!--     sim%.%SLiMSim$addSubpop("p1", slimr_template("pop_size", 100)) -->
+<!--     sim%.%SLiMSim$addSubpop("p2", ..pop_size..) -->
+<!--     ## set migration rates between populations -->
+<!--     p1%.%Subpopulation$setMigrationRates(p2, slimr_template("mig_rate", 0.01)) -->
+<!--     p2%.%Subpopulation$setMigrationRates(p1, ..mig_rate..) -->
+<!--   }), -->
+
+<!--   slim_block(1, 10000, late(), { -->
+<!--     ## output Fst -->
+<!--     slimr_output(calcFST(p1.genomes, p2.genomes), name = "fst", -->
+<!--                  do_every = 5) -->
+<!--   }), -->
+
+<!--   slim_block(10000, late(), { -->
+<!--     ## tell the simulation to finish -->
+<!--     sim%.%SLiMSim$simulationFinished() -->
+<!--   }) -->
+<!-- ) -->
+
+<!-- future::plan(future::multisession(workers = 4)) -->
+
+<!-- nvals <- 12 -->
+<!-- params <- data.frame(mut_rate = runif(nvals, 1e-9, 1e-6), -->
+<!--                      pop_size = ceiling(runif(nvals, 10, 100)), -->
+<!--                      mig_rate = rbinom(nvals, 1, 0.5) * runif(nvals, 0, 0.5)) -->
+
+<!-- many_scripts <- slimr_script_render(sim_fst, template = params) -->
+
+<!-- all_run <- slim_run(many_scripts, parallel = TRUE) -->
+
+<!-- all_fst <- imap_dfr(all_run,  -->
+<!--                     ~ slim_results_to_data(.x) %>% -->
+<!--                       mutate(fst = as.numeric(unlist(data)), -->
+<!--                              rep = .y)) -->
+
+
+<!-- p <- ggplot(all_fst, aes(generation, fst)) + -->
+<!--     theme_minimal() -->
+
+<!-- rv <- reactiveValues(data = all_fst) -->
+
+<!-- observeEvent(input$run, { -->
+
+<!--   rv$data <- { -->
+
+<!--     params <- data.frame(mut_rate = runif(nvals, 1e-9, 1e-6), -->
+<!--                      pop_size = ceiling(runif(nvals, 10, 100)), -->
+<!--                      mig_rate = rbinom(nvals, 1, 0.5) * runif(nvals, 0, 0.5)) -->
+
+<!--     many_scripts <- slimr_script_render(sim_fst, template = params) -->
+
+<!--     all_run <- slim_run(many_scripts, parallel = TRUE) -->
+
+<!--     all_fst <- imap_dfr(all_run,  -->
+<!--                         ~ slim_results_to_data(.x) %>% -->
+<!--                           mutate(fst = as.numeric(unlist(data)), -->
+<!--                                  rep = .y)) -->
+<!--     all_fst -->
+
+<!--   } -->
+
+<!-- }) -->
+
+<!-- output$fst_plot2 <- renderPlot({ -->
+
+<!--   p <- p + -->
+<!--       geom_path(aes(group = rep), alpha = 0.6, data = rv$data) -->
+
+<!--   return(p) -->
+
+<!-- }) -->
+<!-- ``` -->
+
+
+## Evolving Sequences
+
+The above examples used the default method of generating mutations in SLiM which is simply to track where mutations have occurred relative to an initial genome in the simulation. By default there is no link between these mutations and any actual sequence change. In most cases, this is fine as a theoretically pure way of thinking about mutations. However, in real biological systems, often we are stuck with the much messier reality of DNA sequences, strings of four letters. Therefore there are many situations where you might want to be able to simulate DNA sequences evolving according to various rules. SLiM has a nucleotide-based simulation option, which allows you to simulate sequences evolving according to various classic evolutionary models (such as Jukes-Cantor etc.), Like everything else in SLiM, it is of course possible to customize a nucleotide-based model to create evolutionary scenarios of whatever complexity you want, including simulating indels, epigenetic interactions, etc. Here we will show a very simple nucleotide-based model, to give you an idea of how it is done, and to show that you can then use the many tools of R for manipulating and analysing nucleotide sequences to process the results of your simulation. To learn more about nucleotide-based models, see [here in the SLiM manual](http://benhaller.com/slim/SLiM_Manual.pdf#page=442). The following is a SLiM model that simulates 10 isolated subpopulations, evolving according to a Jukes-Cantor model of sequence evolution, and with all the regular dynamics of the default Wright-Fisher model.
+
+```{r make_nuc_model, echo=TRUE}
+
+isolate_sim <- slim_script(
+  slim_block(initialize(), {
+    setSeed(!!seed);
+    initializeSLiMOptions(nucleotideBased=T);
+    initializeAncestralNucleotides(randomNucleotides(1000));
+    initializeMutationTypeNuc("m1", 0.5, "f", 0.0);
+    initializeGenomicElementType("g1", m1, 1.0, mmJukesCantor(1e-5));
+    initializeGenomicElement(g1, 0, 1000 - 1);
+    initializeRecombinationRate(1e-8);
+  }),
+  slim_block(1, {
+    for(i in 1:10) {
+      sim.addSubpop(i, 100)  
+    }
+    
+  }),
+  # slim_block(1, 1000, late(), {
+  # }),
+  slim_block(10000, late(), {
+    slimr_output_nucleotides(subpops = TRUE)
+    sim.simulationFinished()
+  })
+)
+
+isolate_sim
+```
+
+Let's run that:
+
+```{r run_it}
+iso_run <- slim_run(isolate_sim)
+```
+
+Above we used the `slimr` 'helper' function `slimr_output_nucleotides()`. This tells SLiM to output full nucleotide sequences for the full population. You can then extract these using the `slim_results_to_data()` function, which detects the nucleotide output and converts it into a `DNAStringSet` object from the package `Biostrings`.
+
+```{r get_dna_data, echo=TRUE}
+dna <- slim_results_to_data(iso_run)
+dna
+dna$data[[1]]
+```
+
+We can now use all of the many R tools for working with sequences data. Let's make a quick UPGMA tree and plot it.
+
+```{r nj_tree, echo = TRUE}
+## convert to ape::DNAbin
+al <- as.DNAbin(dna$data[[1]])
+dists <- dist.dna(al)
+upgma_tree <- as.phylo(hclust(dists, method = "average"))
+pal <- paletteer_d("RColorBrewer::Paired", 10)
+plot(upgma_tree, show.tip.label = FALSE)
+tiplabels(pch = 19, col = pal[as.numeric(as.factor(dna$subpops[[1]]))])
+```
+
+So that looks about what we might expect from 10 completely isolated populations evolving randomly.
+
+Let's try and modify that simulation to have populations split every so often into two subpopulations which are subsequently reproductively isolated, which could simulate something like vicariance. Here, we will also show you the simplest way to get data from R into your simulation, using the `!!` forcing operator. We will explain why we need to use this a little bit later.
+
+```{r change_to_splitting, echo=TRUE}
+## set some parameters
+split_prob <- 0.001
+max_subpops <- 10
+
+## specify simulation
+split_isolate_sim <- slim_script(
+  slim_block(initialize(), {
+    setSeed(!!seed);
+    initializeSLiMOptions(nucleotideBased=T);
+    initializeAncestralNucleotides(randomNucleotides(1000));
+    initializeMutationTypeNuc("m1", 0.5, "f", 0.0);
+    initializeGenomicElementType("g1", m1, 1.0, mmJukesCantor(1e-5));
+    initializeGenomicElement(g1, 0, 1000 - 1);
+    initializeRecombinationRate(1e-8);
+    
+  }),
+  slim_block(1, {
+    
+    sim.addSubpop(1, 100)
+    
+  }),
+  slim_block(1, 10000, late(), {
+    
+    if(rbinom(1, 1, !!split_prob) == 1) {
+      ## split a subpop
+      subpop_choose = sample(sim.subpopulations, 1)
+      sim.addSubpopSplit(subpopID = max(sim.subpopulations.id) + 1, 
+                         size = 100, 
+                         sourceSubpop = subpop_choose)
+      if(size(sim.subpopulations) > !!max_subpops) {
+        subpop_del = sample(sim.subpopulations, 1)
+        subpop_del.setSubpopulationSize(0)
+      }
+    }
+    
+    slimr_output_nucleotides(subpops = TRUE, do_every = 100)
+      
+  }),
+  slim_block(10000, late(), {
+    sim.simulationFinished()
+  })
+)
+
+results <- slim_run(split_isolate_sim)
+
+res_data <- slim_results_to_data(results)
+
+res_data
+
+## sequences at generation 100
+res_data$data[[1]]
+## sequences at generation 10000
+res_data$data[[100]]
+
+```
+
+Now let's see what that tree looks like at the end this time:
+
+```{r nj_tree2, echo=TRUE}
+## convert to ape::DNAbin
+al <- as.DNAbin(res_data$data[[100]])
+dists <- dist.dna(al)
+upgma_tree <- as.phylo(hclust(dists, method = "average"))
+pal <- paletteer_d("RColorBrewer::Paired", 10)
+plot(upgma_tree, show.tip.label = FALSE)
+tiplabels(pch = 19, col = pal[as.numeric(as.factor(res_data$subpops[[100]]))])
+```
+
+However, now we have a time series, so we can generate a little animation to see how the system evolves.
+
+```{r animate_tress, animation.hook='gifski',interval=0.25,echo=TRUE,cache=TRUE,cache.extra=seed}
+make_tree_plot <- function(seqs, pal, subpops) {
+  al <- as.DNAbin(seqs)
+  dists <- dist.dna(al)
+  upgma_tree <- as.phylo(hclust(dists, method = "average"))
+  plot(upgma_tree, show.tip.label = FALSE)
+  tiplabels(pch = 19, col = pal[as.numeric(as.factor(subpops))])
+}
+
+pal <- paletteer_d("RColorBrewer::Paired", 10)
+
+walk2(res_data$data, res_data$subpops,
+              ~ make_tree_plot(.x, pal, .y))
+
+```
+
+We can also look at this using another classic method for visualising genetic relationships often used for exploratory analysis, Principal Coordinate Analysis. This is all simple because your simulations results are in R in standard formats, meaning any package available in R can now be easily used on simulation results. Let's test PCoA.
+
+```{r simple_pcoa}
+al <- as.DNAbin(res_data$data[[100]])
+dists <- dist.dna(al)
+pcoa <- cmdscale(dists) %>%
+  as.data.frame() %>%
+  mutate(subpop = res_data$subpops[[100]])
+
+ggplot(pcoa, aes(V1, V2)) +
+  geom_point(aes(colour = subpop)) +
+  scale_colour_manual(values = pal) +
+  theme_minimal()
+```
+
+### The `!!` operator
+
+`!!` is the forcing operator (called the bang-bang operator), which we used above to insert the value of an R object into our `slim_script`. Why couldn't we just refer to the object directly? Let's see what happens if we try that. In this case we were referring to our R object `seed`. Here we remove the `!!` operator and try to run it.
+
+```{r test_no_op}
+
+isolate_sim_no_bang_bang <- slim_script(
+  slim_block(initialize(), {
+    setSeed(seed);
+    initializeSLiMOptions(nucleotideBased=T);
+    initializeAncestralNucleotides(randomNucleotides(1000));
+    initializeMutationTypeNuc("m1", 0.5, "f", 0.0);
+    initializeGenomicElementType("g1", m1, 1.0, mmJukesCantor(1e-5));
+    initializeGenomicElement(g1, 0, 1000 - 1);
+    initializeRecombinationRate(1e-8);
+  }),
+  slim_block(1, {
+    for(i in 1:10) {
+      sim.addSubpop(i, 100)  
+    }
+    
+  }),
+  # slim_block(1, 1000, late(), {
+  # }),
+  slim_block(10000, late(), {
+    slimr_output_nucleotides(subpops = TRUE)
+    sim.simulationFinished()
+  })
+)
+
+slim_run(isolate_sim_no_bang_bang)
+
+```
+
+So we see that SLiM generated an error, 'undefined identifier seed'. This is because all code inside a `slim_block` call is assumed to be SLiM code (except for `slimr` verbs), so that when we refer to `seed`, it is assumed we are referring to an object defined within SLiM, not within R. Using the !! operator overrides this behaviour, by 'forcing' execution of the code that follows it before anything else. Actually it does two things, it forces the object to be evaluated, and then inserts the results of that evaluation in its place. So in this case, `seed` is evaluated, returns the value we earlier assigned it, and then that is inserted into the `slim_block` call. This lets us mix and match references to R objects and SLiM objects in our scripts, which can be pretty handy. The only thing we need to be really careful of is the case where there is something inside SLiM with the same name as something in our environment. In that case it is possible to forget to use the `!!` operator, but our code will still work, with potentially unexpected consequences. Generally this will be rare though. For a more systematic way to insert values from R into a script (and one that doesn't require rerunning the `slim_script` call), you can use `slimr_template`, which we discussed in the first set of examples.
+
+
+
+## Complex Spatially Explicit Simulation
+
+Here we are going to push the SLiM framework much further and do a full spatially explicit simulation with varying a varying landscape. In this simulation, we want individuals to move freely in a two dimensional area, but have their movement affected by the 'resistance' of the landscape. So, the first thing we will do is use R to generate a resistance landscape, and then we can see how to get this landscape into a simulation to be used. We will use the `NLMR` package to first generate a landscape randomly.
+
+```{r gen_landscape}
+
+landscape <- nlm_neigh(100, 100,
+                       p_neigh = 0.8,
+                       p_empty = 0.01,
+                       categories = 8,
+                       neighbourhood = 8)
+plot(landscape)
+
+```
+
+So here we treat larger values as more 'resistant', that is, harder to move through. For the purposes of efficiency in the simulation we will use a simple algorithm for computing individuals movements through the landscape. This algorithm will need an estimate of the gradient of the landscape, where the gradient is defined as a vector field, where each vector points in the direction of greatest increase. Moving away from this gradient will therefore represent the path of least resistance from any given point on the landscape. We can calculate the gradient of an image straighttorwardly in R using `imager`, so we will have to convert our `RasterLayer` to an image (and later back).
+
+```{r convert_to_image}
+landscape_im <- as.cimg(landscape)
+plot(landscape_im)
+grad <- imgradient(landscape_im)
+## standardise gradient to a maximum norm of 1
+norms <- sqrt(grad[[1]]^2 + grad[[2]]^2)
+grad[[1]] <- round(grad[[1]] / max(norms), 3) 
+grad[[2]] <- round(grad[[2]] / max(norms), 3)
+plot(grad)
+```
+
+What has been returns is two images, one specifying the gradient in the 'x' dimension, and another in the 'y' dimension. Combined these specify a vector for each point on the landscape, which points in the direction of steepest ascent. Let's look at this as a vector field.
+
+```{r vector_field}
+grad_data <- expand_grid(x = 1:100, y = 1:100) %>%
+  mutate(x_grad = as.matrix(grad[[1]])[cbind(x, y)],
+         y_grad = as.matrix(grad[[2]])[cbind(x, y)],
+         resistance = as.matrix(landscape_im)[cbind(x, y)])
+
+ggplot(grad_data) + 
+  geom_raster(aes(x, y, fill = resistance), alpha = 0.6) +
+  geom_quiver(aes(x, y, u = x_grad, v = y_grad), vecsize = 2) +
+  scale_fill_viridis_c() +
+  coord_equal() +
+  theme_minimal()
+```
+
+Okay cool! Now we need to get these (3) images into our simulation to help decide how individuals move. generally, they will move down resistance gradients, and move more slowly in high resistance areas. On top of this will be a stochastic element to the movement direction. For this more complex simulation we will write it out block by block, then combine the blocks into a full simulations later. Let's start with the `initialize()` block, where there will be a small difference between this and previous simulations, as we will need to tell SLiM to setup a spatial landscape.
+
+```{r setup_sim}
+res_rast <- rasterFromXYZ(grad_data %>%
+                            dplyr::select(x, y, resistance))
+x_grad_rast <- rasterFromXYZ(grad_data %>%
+                               ## plus 1 is a hack to work around a SLiM bug
+                               mutate(x_grad = x_grad + 1) %>%
+                               dplyr::select(x, y, x_grad))
+y_grad_rast <- rasterFromXYZ(grad_data %>%
+                               mutate(y_grad = y_grad + 1) %>%
+                               dplyr::select(x, y, y_grad))
+
+init_block <- slim_block(initialize(), {
+  ## set the seed in SLiM as well!
+  setSeed(!!seed)
+  ## initialize a spatial model
+  initializeSLiMOptions(dimensionality = "xy");
+  initializeMutationRate(1e-07);
+  initializeMutationType("m1", 0.5, "f", 0);
+  initializeGenomicElementType("g1", m1, 1);
+  initializeGenomicElement(g1, 0, 1e+05 - 1);
+  initializeRecombinationRate(1e-08);
+})
+
+init_block
+```
+
+Most of the setup for the spatial landscape is done in the first step of the simulation, in generation one, before anything else happens. Here is our first block of code, where we create our landscape, and populate it with organisms.
+
+```{r block_1}
+setup_block <- slim_block(1, early(), {
+  sim.addSubpop("p1", slimr_template("N", 100))
+  p1.setCloningRate(1.0)
+  p1.setSpatialBounds(c(0, 0, 1, 1))
+  p1.individuals.setSpatialPosition(p1.pointUniform(..N..))
+  p1.defineSpatialMap("resistance", spatiality = "xy",
+                      values = slimr_inline(res_rast),
+                      interpolate = T)
+  p1.defineSpatialMap("x_grad", spatiality = "xy",
+                      values = slimr_inline(x_grad_rast),
+                      interpolate = T,
+                      valueRange = c(-1, 1),
+                      colors = c("blue", "red"))
+  p1.defineSpatialMap("y_grad", spatiality = "xy",
+                      values = slimr_inline(y_grad_rast),
+                      interpolate = T)
+})
+
+setup_block
+```
+
+There, we have created one subpopulation of 100 individuals, and applied to them a set of spatial bounds, arbitarily between 0 and 1 in both x and y dimensions. We then defined a set of spatial maps for the same subpopulation, for our three spatial rasters, using the `slimr_inline()` function, which allows use to insert arbitrary R objects into a SLiM script by inlining them directly into the script text. Note that by setting `interpolate = TRUE`, SLiM will interpolate values of the grid for coordinates that fall between the grid coordinates, creating a smooth continuous landscape. We could also use `interpolate = FALSE`, in which case SLiM would use nearest neighbour interpolation, which might be slightly faster.
+
+We've used a `slimr_template()` call in the block to make a templated variable for the population size (N). This will make it easy to change this parameter later. Note the special syntax `..N..`, after the first call of `slimr_template()` in a code block (or indeed the entire script), we can refer to the templated variable using the shorthand `..variable_name..`.
+
+Also note that we have set the population to reproduce clonally, for simplicity. By default, SLiM uses biparental mating (even with no sex enabled, so hermaphroditic by default), but the two parents are drawn randomly from the same subpopulation. In this case, this means the parents could come from opposite ends of our landscape, which makes no sense, and will lead to no genetic differentiation across the landscape. We can make mating spatially aware in our simulation, but a much simpler solution for the time being is to make reproduction clonal. That way, all offspring will only have one parent, and therefore originate from only one place on the landscape. 
+
+The next step is to specify some behaviour for our organisms, in terms of their movements relative to the resistance landscape. Here we make use of a reusable SLiM function to calculate the trajectory of an individual based on the gradient at its current position. Let's write this out first as an R function, which we can later convert into a SLiM function.
+
+```{r traj_fun}
+PI <- pi
+calc_trajectory <- function(x_grad, y_grad, resistance, range, noise_strength) {
+  ## get uniform point in a circle around individual
+  radius = runif(length(x_grad), 0, 1)
+  angle = runif(length(x_grad), 0, 2*PI)
+  x = noise_strength * sqrt(radius) * cos(angle)
+  y = noise_strength * sqrt(radius) * sin(angle)
+  ## subtract the gradient vector
+  ## the minus 1 is a hack to work around a SLiM bug
+  x = x - (x_grad - 1)
+  y = y - (y_grad - 1)
+  ## get just the angle
+  angle = atan2(x = x, y = y)
+  ## make magnitude inversely proportional to resistance in current coordinate
+  magnitude = (1 - resistance) * range
+  ## convert back to x, y vector (how much to add to x and y coords)
+  x = magnitude * cos(angle)
+  y = magnitude * sin(angle)
+  return(cbind(x, y))
+}
+
+plot(calc_trajectory(rep(1.5, 100), 1.5, 0.5, 2, 0.6), asp = 1)
+
+```
+
+So we can see that generates more headings traveling away from the gradient (which in the example is 0.5, 0.5, that is diagonally upwards and to the right). We could also add a momentum to the movement that would favour an individual to keep traveling in the same direction it was previously, but we will keep our first attempt a little simpler for now. Let's write out the event block that will move our individuals.
+
+```{r event_block}
+main_late_block <- slim_block(1, .., late(), {
+  inds = sim.subpopulations.individuals
+	location = inds.spatialPosition
+	resistance = p1.spatialMapValue("resistance", location)
+	x_grad = p1.spatialMapValue("x_grad", location)
+	y_grad = p1.spatialMapValue("y_grad", location)
+	trajectories = calc_trajectory(x_grad, y_grad, resistance, 
+	                               slimr_template("range", 0.05),
+	                               1.1)
+	inds.setSpatialPosition(p1.pointReflected(location + trajectories))
+})
+
+main_late_block
+```
+
+In that block we have used a `slimr_template()` call to add a templated variable for the range of movement (e.g. the maximum distance an individual can move in a generation). The last thing we need for this simulation to work is a SLiM block specifying how to set up a new child in the simulation. This is because by default, SLiM does not know that children need to be assigned spatial positions when they are born. We have to tell SLiM to do that. Since we are currently using a Wright-Fisher model, the way this is done is by creating a `modifyChild()` callback block.
+
+```{r modifyChild}
+modify_child_block <- slim_block(modifyChild(), {
+  ## we simply assign the child the same position as its parent 
+  ## (one of them)
+  child.setSpatialPosition(parent1.spatialPosition)
+  
+  ## modifyChild() callbacks must return a logical
+  ## saying whether the child should stay or be removed
+  ## here this should always be TRUE, for stay
+  return(T)
+})
+
+modify_child_block
+```
+
+We now have enough to try and put together a script and see if it runs. Let's put these blocks together and add a final block to output results as well.
+
+```{r put_it_together}
+
+spat_script <- slim_script(init_block,
+                           setup_block,
+                           main_late_block,
+                           modify_child_block, 
+                           slim_block(1, 1000, early(), {
+                             slimr_output_full()
+                           }))
+
+spat_script
+
+```
+
+We also need to make our SLiM function called `calc_trajectory`, which we can do using the `slim_function()` function. This returns a `slimr_block` object which we can add to our script by concatenating it to the front.
+
+```{r make_slim_fun}
+slim_fun_block <- slim_function("float x_grad", "float y_grad",
+                                "float resistance", "float range",
+                                "float noise_strength",
+                                name = "calc_trajectory",
+                                return_type = "float",
+                                body = calc_trajectory)
+
+slim_fun_block
+
+spat_script <- c(slim_script(slim_fun_block), spat_script)
+spat_script
+```
+
+Okay, let's give this a try!
+
+```{r run_spat}
+spat_run <- slim_run(spat_script)
+```
+
+Okay that ran just fine. Now we can extract the coordinates of our individuals from the `slimr_results` object returned by `slim_run`, then use them to plot an animation of individual movement.
+
+```{r plot_anim_1, cache = TRUE, cache.extra = seed}
+spat_dat <- slim_outputFull_extract(spat_run$output_data,
+                                    "coordinates")
+
+anim <- ggplot(spat_dat, aes(x, y)) +
+  geom_raster(aes(fill = resistance), data = grad_data %>%
+                dplyr::mutate(x = x / 100, y = y / 100)) +
+  geom_point(colour = "red") +
+  scale_fill_viridis_c() +
+  coord_equal() +
+  transition_time(generation) +
+  theme_minimal()
+
+animate(anim, nframes = 1000, fps = 30)
+```
+
+So, that seems to show what we expect: individuals stay mostly to the low resistance parts of the landscape and have trouble moving across high resistance parts. A couple things that may be less expected are also shown. The first is that individuals seems to spend more time around the transitional areas between high and low resistance (at least to my eye). I think this is a consequence of a trade-off between movement speed and moving down the gradient. Individuals will move away from high resistance areas, but if they are in them already they will move slowly. In low resistance areas they will move faster, allowing them to move quickly out of low resistance areas (from the stochastic portion of the movement). This means individuals will spend less time in low resistance because they move through them quickly, and less time in high resistance because they try to move down a resistance gradient, making for a sweet spot in intermediate resistance. This is an interesting phenomenon which deserves more thought about whether it is actually a realistic outcome or maybe just an artifact of some other unrealistic assumptions of the model.
+
+The second potentially unexpected pattern is that individuals stay fairly clustered in space, leading to a 'moving blob' type of pattern. This is in part a result of the Wright-Fisher model assumption of a constant population size across the landscape and non-overlapping generations. This means that a certain number of offspring are chosen
+to replace the parental generation, and since offspring have the same spatial coordinates as their parents, each generation will be a random sample from the same spatial distribution as the previous generation. This creates the moving blob like pattern. Another way to put it is that parts of the landscape that are hard to get to within one generation will have very low populations, and therefore are likely to go stochastically extinct through sampling, leading to a loss of outlying parts of the spatial distribution. We can try and see if increasing the total population size will lead to better spatial representation. A more realistic solution would be to change global population regulation to local population regulation, such that different parts of the landscape have their own local carrying capacity. This means that far-flung parts of the landscape, though hard to reach, will provide an advantage of lower competition, which would help population establish around the edge of the main blob. However, this would violate Wright-Fisher assumptions. Luckily, SLiM can do non-Wright-Fisher simulations and so this is perfectly possible. However, non-Wright-Fisher models add a lot of additional complexity to a simulation that needs to be kept track of, and so for the purposes of this tutorial we are not going to go into it. However, if you are interested in pursuing realistic complexity in a landscape genomics model, it would be well worth engaging with this. An example of a non-Wright-Fisher model will be provided as a vignette with the `slimr` package soon, for those interested.
+
+Let's run a model with a few more individuals and see if we can look at population structure across our landscape. Then, we can see if we can add a little more complexity with spatial sexual reproduction. We can use the `slimr_script_render` function to generate a new script with different values of our templated variables.
+
+```{r run_model_with_more, cache = TRUE, cache.extra = seed}
+spat_script_more <- slimr_script_render(spat_script, template = list(N = 500))
+spat_script_more
+
+spat_run_more <- slim_run(spat_script_more)
+
+spat_dat_more <- slim_outputFull_extract(spat_run_more$output_data,
+                                         "coordinates")
+
+anim_more <- ggplot(spat_dat_more, aes(x, y)) +
+  geom_raster(aes(fill = resistance), data = grad_data %>%
+                dplyr::mutate(x = x / 100, y = y / 100),
+              alpha = 0.7) +
+  geom_point(colour = "red") +
+  scale_fill_viridis_c() +
+  transition_time(generation) +
+  theme_minimal()
+
+animate(anim_more, nframes = 1000, fps = 30)
+
+```
+
+We will have a look at the genetic data only for the final generation to see whether any genetic structure has developed over the whole course of the simulation, and simulating a typical experimental design where individuals are sampled at a single timepoint (the present) and inferences drawn from that. Since we used a simple mutation model for this simulation (only whether a mutation has happened a locus is kept track of, not nucleotide sequences), the most appropriate way to look at the data is in the form of single nucleotide polymorphism (SNPs). We can treat each mutation as a SNP, or an alternative allele in the population. A useful R data structure for this type of data is a `genlight` object from the `adegenet` package, which uses an efficient data structure for this type of data. A number of different R packages use this format and implement a host of useful analytical tools for analysing this data too. `slimr` has a function to convert its output to `genlight` which we will use here to look at structure. First let's extract the coordinates of the final generation and see where our population finds itself.
+
+```{r measure_genstats}
+final_gen <- spat_run_more$output_data %>%
+  filter(generation == 1000)
+
+coords <- slim_outputFull_extract(final_gen, "coordinates")
+
+ggplot(coords, aes(x, y)) +
+  geom_raster(aes(fill = resistance), data = grad_data %>%
+                dplyr::mutate(x = x / 100, y = y / 100),
+              alpha = 0.6) +
+  geom_point(colour = "red") +
+  coord_equal() +
+  scale_fill_viridis_c() +
+  theme_minimal()
+
+```
+
+Now let's extract a `genlight`.
+
+```{r extract_genlight}
+spat_gl <- slim_output_genlight(final_gen)
+plot(spat_gl)
+```
+
+So right away one thing to notice is that the maximum number of the second allele is one. In other words we only have no homozygotes for alternative alleles. This makes sense since we are using a clonal model here. This means that the only way to get a homozygote in the alternative allele is to have two independent mutation in the exact same location on both chromosomes, which is pretty unlikely for a genome of this size, and in only 1000 generations. We will see when we construct a sexual model that it should be dramatically easier to get homozygotes for the alternative allele thanks to recombination and crossing over. 
+
+Let's explore a simple way to visualize genetic structure across the landscape. We will use the `dartR` package to calculate a genetic differentiation measure based on SNPs. `dartR` is a package designed for working with SNP data, with a particular specialisation on data produced using the DArTSeq method (of local Canberra company [Diversity Arrays Technology](https://www.diversityarrays.com)). Using a pairwise measure of differnetiation between individuals we can then run a basic clustering algorithm, and plot clusters on our map using different colours. First we will convert our `genlight` to a ploidy of 2, since it would have automatically assumed ploidy = 1 because there are no homozygotes for the second allele.
+
+```{r diff_stats}
+ploidy(spat_gl) <- 2
+gen_diff <- dist(spat_gl, "manhattan")
+
+gen_clust <- hclust(gen_diff)
+plot(as.dendrogram(gen_clust) %>% 
+       set("branches_k_color", k = 10),
+     leaflab = "none")
+
+gen_cut <- cutree(gen_clust, k = 10)
+
+dat_join <- coords %>%
+  left_join(tibble(unique_ind_id = names(gen_cut),
+                   cluster = as.factor(gen_cut)))
+
+ggplot(dat_join, aes(x, y)) +
+  geom_raster(aes(fill = resistance), data = grad_data %>%
+                dplyr::mutate(x = x / 100, y = y / 100), 
+              alpha = 0.3) +
+  geom_point(aes(colour = cluster)) +
+  scale_fill_viridis_c() +
+  coord_equal() +
+  theme_minimal()
+
+```
+
+Okay, so that looks pretty interesting actually. Clusters appear to be in different low resistance patches that tend to be separated by high resistance areas. This could just be my eyes fooling me though. We can try and calculate a cost distance between each individual (or cluster) and compare than with their genetic distance. One thing to look at is whether this cost distance better explains genetic distance relative to simple geographic distance. We will use the `gdistance` package to calculate cost distance.
+
+```{r calc_cost_dist}
+## this comes from the gdistance package
+costtrans <- transition(res_rast, function(x) mean(1 - x),
+                        directions = 8)
+locs <- coords %>%
+  dplyr::select(x, y) %>%
+  mutate(x = x * 100, y = y * 100) %>%
+  as.matrix()
+
+costdist <- commuteDistance(costtrans, locs) %>%
+  as.dist()
+geodist <- dist(locs)
+
+
+## some stats
+summary(lm(as.vector(gen_diff) ~ as.vector(costdist)))
+summary(lm(as.vector(gen_diff) ~ as.vector(geodist)))
+```
+
+So in this case we have a very weak relationship between both cost distance and geographic distance (using highly incorrect statistical methods), in the expected direction (positive), but the cost distance is a less noisy relationship. We are probably getting a weak effect due to a number of reasons. For one, we have only ran the simulation for 1000 generation, which is not a lot of time to accumulate genetic differences. The largest distance between any two individuals here is only `r max(gen_diff)` mutations. Perhaps if we run the simulation longer we will get more differentiation and therefore more discrimination ability. A bigger issue is likely the shifting nature of the whole population through time. We saw from the animation that the entire population tends to shift around on the landscape, suggesting that the cost distance we calculate on the current distribution of individuals is a small snapshot of a potentially complex history. You could imagine that two subpopulations separated by a small cost distance could shift around and suddenly find themselves separated by a high cost distance. We can't really account for this with only one timepoint of spatial and genetic data. In this simulation stable spatial population are unlikely. This, however, could become more likely if we used a different type of landscape (perhaps with some hard borders) and/or a different movement model (perhaps with occasional long distance "jumps" by certain individuals).
+
+For now, let's see how to add sexual reproduction to this simulation, and run it with more individuals and for a lot longer. To do this we will need to modify our `initialize()` block, our generation 1 setup block, and our main event block. We will also need to add a `mateChoice()` callback block to tell SLiM how to choose mates in a spatially explicit way. 
+
+```{r make_sexual}
+new_init_block <- init_block <- slim_block(initialize(), {
+  setSeed(!!seed)
+  ## initialize a spatial model
+  initializeSLiMOptions(dimensionality = "xy");
+  initializeMutationRate(1e-07);
+  initializeMutationType("m1", 0.5, "f", 0);
+  initializeGenomicElementType("g1", m1, 1);
+  initializeGenomicElement(g1, 0, 1e+05 - 1);
+  initializeRecombinationRate(1e-08);
+  ## add sexual reproduction ("A" mean autosomal (no sex chromosomes))
+  initializeSex("A");
+  ## initialise a spatial interaction (for finding mates)
+  initializeInteractionType("i1", "xy", 
+                            reciprocal = T, 
+                            maxDistance = 0.05)
+  i1.setInteractionFunction("f", 1.0) ## simplest is 1 or 0
+})
+
+init_block
+```
+
+So we have initialized sex in the simulation and added a spatial interaction type for finding mates. The interaction function simply returns a 1 if individuals are closer than the maxDistance, and 0 otherwise. It is the simplest possible function. More complex functions are possible, such as distance decaying functions, which would be more realistic but would add more parameters to keep track of. Let's now modify the main event block which now just has to evaluate the above interaction each generation to update it based on the new positions of all individuals. It can then be used in the mateChoice block to find mates. Let's specify those both now.
+
+```{r make_main_and_matechoice}
+new_main_late_block <- slim_block(1, .., late(), {
+  inds = sim.subpopulations.individuals
+	location = inds.spatialPosition
+	resistance = p1.spatialMapValue("resistance", location)
+	x_grad = p1.spatialMapValue("x_grad", location)
+	y_grad = p1.spatialMapValue("y_grad", location)
+	trajectories = calc_trajectory(x_grad, y_grad, resistance, 
+	                               slimr_template("range", 0.05),
+	                               0.8)
+	inds.setSpatialPosition(p1.pointReflected(location + trajectories))
+	
+	## evaluate spatial interaction (this just updates it basically)
+	i1.evaluate(p1)
+	
+})
+
+new_main_late_block
+
+mate_choice_block <- slim_block(mateChoice(), {
+  return(i1.strength(individual) * weights)
+})
+
+mate_choice_block
+```
+
+The mateChoice block just tell SLiM to multiply the standard fitness-based weights used to choose a mate normally by the strength of the spatial interaction. In this case this is a 1 or 0, depending on whether the mate is within 0.05 distance of the chosen individual (specified by `individual` in the code). This means that a mate will be chosen from only individuals nearby.  Lastly, we can't forget to turn off clonal reproduction, as keeping that on would lead to some bizarre results probably (and I know because I did forget originally and was very confused by the genetic end result!).
+
+```{r new_setup_block}
+new_setup_block <- slim_block(1, early(), {
+  sim.addSubpop("p1", slimr_template("N", 100))
+  p1.setSpatialBounds(c(0, 0, 1, 1))
+  p1.individuals.setSpatialPosition(p1.pointUniform(..N..))
+  p1.defineSpatialMap("resistance", spatiality = "xy",
+                      values = slimr_inline(res_rast),
+                      interpolate = T)
+  p1.defineSpatialMap("x_grad", spatiality = "xy",
+                      values = slimr_inline(x_grad_rast),
+                      interpolate = T,
+                      valueRange = c(-1, 1),
+                      colors = c("blue", "red"))
+  p1.defineSpatialMap("y_grad", spatiality = "xy",
+                      values = slimr_inline(y_grad_rast),
+                      interpolate = T)
+  ## also evaluate interaction for the first time, ready for the late()
+  ## block
+  i1.evaluate(p1)
+})
+
+new_setup_block
+```
+
+Okay, let's see if we can run this version. Now we will also only output the data we need for visualisation during the simulation (e.g. coordinates), and then output the full genetic data only at the end. This should save computation time and memory. We will run this for 10000 generations.
+
+```{r make_new_sim}
+new_spat_script <- slim_script(slim_fun_block,
+                               new_init_block,
+                               new_setup_block,
+                               new_main_late_block,
+                               modify_child_block, 
+                               mate_choice_block,
+                               slim_block(1, 5000, early(), {
+                                 ## do_every parameter says to only
+                                 ## output every 5 generations
+                                 slimr_output_coords("xy", do_every = 5)
+                                 slimr_output_sex(do_every = 5)
+                                 }),
+                               slim_block(5000, late(), {
+                                 slimr_output_full()
+                               }))
+
+new_spat_script
+```
+Now run it:
+
+```{r run_again}
+new_spat_script_more <- slimr_script_render(new_spat_script,
+                                            template = list(N = 500))
+new_spat_run <- slim_run(new_spat_script_more)
+```
+
+Running this model takes considerably longer, both because of the larger number of generations, and because of the more complex scenarios.
+Let's extract the coordinates and sex information and plot an animation.
+
+```{r get_anim, cache=TRUE, cache.extra=seed}
+coord_sex <- slim_results_to_data(new_spat_run$output_data %>%
+                                    filter(name != "full_output"))
+
+sex_all <- coord_sex %>%
+  filter(name == "sex") %>%
+  dplyr::select(generation, data) %>%
+  unnest_longer(col = data, 
+                values_to = "sex",
+                indices_include = TRUE)
+  
+coords_all <- coord_sex %>%
+  filter(name %in% c("x", "y")) %>%
+  dplyr::select(generation, name, data) %>%
+  unnest_longer(col = data, 
+                values_to = "coordinate",
+                indices_include = TRUE) %>%
+  pivot_wider(names_from = name, values_from = coordinate)
+
+dat_all <- coords_all %>%
+  left_join(sex_all) %>%
+  mutate(x = as.numeric(x),
+         y = as.numeric(y))
+
+dat_all
+
+anim_more2 <- ggplot(dat_all, aes(x, y)) +
+  geom_raster(aes(fill = resistance), data = grad_data %>%
+                dplyr::mutate(x = x / 100, y = y / 100),
+              alpha = 0.5) +
+  geom_point(aes(colour = sex)) +
+  scale_fill_viridis_c() +
+  scale_colour_manual(values = c("red", "orange")) +
+  coord_equal() +
+  transition_time(generation) +
+  theme_minimal()
+
+animate(anim_more2, nframes = 1000, fps = 30)
+```
+
+Here's where we are at the end of the simulation:
+
+```{r end_of}
+ggplot(dat_all %>% filter(generation == 5000), aes(x, y)) +
+  geom_raster(aes(fill = resistance), data = grad_data %>%
+                dplyr::mutate(x = x / 100, y = y / 100), 
+              alpha = 0.5) +
+  geom_point(aes(colour = sex)) +
+  scale_fill_viridis_c() +
+  scale_colour_manual(values = c("red", "orange")) +
+  coord_equal() +
+  theme_minimal()
+```
+
+Okay, let's look again at genetic differentiation.
+
+```{r gen_diff_again}
+new_spat_gl <- slim_output_genlight(new_spat_run$output_data %>%
+                                      filter(generation == 5000))
+plot(new_spat_gl)
+```
+
+As expected we have a lot more SNPs to work with (over 600) and now we have plenty of homozygotes for the alternative allele, as expected in a sexually reproducing population.
+
+```{r cluster_again}
+new_gen_diff <- dist(new_spat_gl, "manhattan")
+
+new_gen_clust <- hclust(new_gen_diff)
+plot(as.dendrogram(new_gen_clust) %>% 
+       set("branches_k_color", k = 12),
+     leaflab = "none")
+
+new_gen_cut <- cutree(new_gen_clust, k = 12)
+
+dat_join <- dat_all %>%
+  filter(generation == 5000) %>%
+  mutate(unique_ind_id = paste0("p1:i", data_id - 1L)) %>%
+  left_join(tibble(unique_ind_id = names(new_gen_cut),
+                   cluster = as.factor(new_gen_cut)))
+
+ggplot(dat_join, aes(x, y)) +
+  geom_raster(aes(fill = resistance), data = grad_data %>%
+                dplyr::mutate(x = x / 100, y = y / 100), 
+              alpha = 0.3) +
+  geom_point(aes(colour = cluster)) +
+  scale_fill_viridis_c() +
+  coord_equal() +
+  theme_minimal()
+
+
+```
+
+So here we actually see very little genetic differentiation and even greater clustering of our population in space. These are both likely the consequence of sexual reproduction. There is little differentiation because recombination allows the spread of genetic information more easily, plus the population is stuck in a single patch where movement is not too restricted within it. The spatial aggregation is even more pronounced because it in now even easier for isolated populations to go extinct because if because you need to have a minumum number of both males and females to maintain a breeding population, if either go stochastically extinct then the whole subpopulation will go extinct as well.
+
+It is now looking like if we want to get interesting behaviour we may have to use a slightly more realistic simulation with spatial competition. Well, why don't we give it a shot? Below is a script in full that runs spatial competition. As an exercise, go through the script an see if you can tell where the key difference are?
+
+```{r spat_comp_script}
+spat_comp <- slim_script(
+  
+  slim_function("float x_grad", "float y_grad",
+                "float resistance", "float range",
+                "float noise_strength",
+                name = "calc_trajectory",
+                return_type = "float",
+                body = calc_trajectory),
+  
+  slim_block(initialize(), {
+    setSeed(!!seed);
+    ## initialize non-WrightFisher model
+    initializeSLiMModelType("nonWF");
+    ## initialize a spatial model
+    initializeSLiMOptions(dimensionality = "xy");
+    initializeMutationRate(1e-07);
+    initializeMutationType("m1", 0.5, "f", 0);
+    initializeGenomicElementType("g1", m1, 1);
+    initializeGenomicElement(g1, 0, 1e+05 - 1);
+    initializeRecombinationRate(1e-08);
+    ## add sexual reproduction ("A" mean autosomal (no sex
+    ## chromosomes))
+    initializeSex("A");
+    ## initialise a spatial interaction (for finding mates)
+    initializeInteractionType("i1", "xy", 
+                              reciprocal = T, 
+                              maxDistance = 0.02)
+    i1.setInteractionFunction("f", 1.0) ## simplest is 1 or 0
+    ## spatial competition interaction
+    initializeInteractionType("i2", "xy", 
+                              reciprocal = T, 
+                              maxDistance = slimr_template("comp_dist", 0.06) * 3);
+    i2.setInteractionFunction("n", 1.0, ..comp_dist..);
+  }),
+  
+  slim_block(reproduction(NULL, "F"), { ## only run on females
+    ## find all males within maximum mating distance
+    possible_mates = subpop.individuals[i1.strength(individual) == 1.0]
+    possible_mates = possible_mates[possible_mates.sex == "M"]
+    ## choose a mate
+    if(size(possible_mates)) { ## returns FALSE if zero length
+      mate = sample(possible_mates, 1);
+    } else {
+      mate = integer(0);
+    }
+    
+    for(i in seqLen(rpois(1, slimr_template("fecundity", 2.5)))) {
+      if(size(mate)) {
+        ## add outcrossed child to population
+        child = subpop.addCrossed(individual, mate);
+        ## set offspring position
+        ## we need to add a bit of noise otherwise competition with parent
+        ## will be too strong
+        child.setSpatialPosition(individual.spatialPosition)
+      }
+    }
+  }),
+  
+  slim_block(1, early(), {
+    sim.addSubpop("p1", slimr_template("N", 100))
+    p1.setSpatialBounds(c(0, 0, 1, 1))
+    p1.individuals.setSpatialPosition(p1.pointUniform(..N..))
+    p1.defineSpatialMap("resistance", spatiality = "xy",
+                        values = slimr_inline(slimr_template("res_rast_name", "res_rast", unquote_strings = TRUE), delay = TRUE),
+                        interpolate = T)
+    p1.defineSpatialMap("x_grad", spatiality = "xy",
+                        values = slimr_inline(slimr_template("x_grad_rast_name", "x_grad_rast", unquote_strings = TRUE), delay = TRUE),
+                        interpolate = T,
+                        valueRange = c(-1, 1),
+                        colors = c("blue", "red"))
+    p1.defineSpatialMap("y_grad", spatiality = "xy",
+                        values = slimr_inline(slimr_template("y_grad_rast_name", "y_grad_rast", unquote_strings = TRUE), delay = TRUE),
+                        interpolate = T)
+    ## also evaluate interaction for the first time, ready for the late()
+    ## block
+    # i1.evaluate(p1)
+    # i2.evaluate(p1)
+  }),
+  
+  slim_block(1, .., early(), {
+
+    ## evaluate spatial interaction (this just updates it basically)
+    i2.evaluate()
+    
+    inds = p1.individuals;
+    competition = i2.totalOfNeighborStrengths(inds)
+    ## basically Lotka-Volterra competition (locally)
+    ## the second part of the equation standardises by the area of a circle
+    ## the + 1 adds the influence of an individual on itself
+    competition = (competition + 1) / (2 * PI * ..comp_dist..^2)
+    inds.fitnessScaling = slimr_template("K", 500) / competition
+  }),
+  
+  slim_block(1, .., late(), {
+    ## evaluate spatial interaction (this just updates it basically)
+  	i1.evaluate(p1)
+    
+    inds = sim.subpopulations.individuals
+  	location = inds.spatialPosition
+  	resistance = p1.spatialMapValue("resistance", location)
+  	x_grad = p1.spatialMapValue("x_grad", location)
+  	y_grad = p1.spatialMapValue("y_grad", location)
+  	trajectories = calc_trajectory(x_grad, y_grad, resistance, 
+  	                               slimr_template("range", 0.05),
+  	                               0.1)
+  	inds.setSpatialPosition(p1.pointReflected(location + trajectories))
+  }),
+  
+  slim_block(1, 1000, late(), {
+    ## do_every parameter says to only
+    ## output every 5 generations
+    slimr_output_coords("xy")
+    slimr_output_sex()
+  }),
+  
+  slim_block(1000, late(), {
+    slimr_output_full()
+  })
+  
+)
+
+spat_comp
+```
+
+Here we've also demonstrated the use of nested `slimr` verbs. We've nested `slimr_template()` within `slimr_inline()` so that we can later change the name of the R object we want to insert easily, without having to respecify our whole script. We have to use the `unquote_strings = TRUE` argument for `slimr_template`, which makes sure that the character value we insert gets `unquoted` and treated as a symbol by R, and we have to use the `delay = TRUE` argument for `slimr_inline`, so that the evaluation of the R object doesn't happen right away, but rather, when the script is rendered.
+
+
+```{r big_sim, cache=TRUE, cache.extra=seed}
+
+spat_comp_run <- slim_run(spat_comp)
+
+coord_sex <- slim_results_to_data(spat_comp_run$output_data %>%
+                                    filter(name != "full_output"))
+
+sex_all <- coord_sex %>%
+  filter(name == "sex") %>%
+  dplyr::select(generation, data) %>%
+  unnest_longer(col = data, 
+                values_to = "sex",
+                indices_include = TRUE)
+  
+coords_all <- coord_sex %>%
+  filter(name %in% c("x", "y")) %>%
+  dplyr::select(generation, name, data) %>%
+  unnest_longer(col = data, 
+                values_to = "coordinate",
+                indices_include = TRUE) %>%
+  pivot_wider(names_from = name, values_from = coordinate)
+
+dat_all <- coords_all %>%
+  left_join(sex_all) %>%
+  mutate(x = as.numeric(x),
+         y = as.numeric(y))
+
+dat_all
+
+anim_spat_comp <- ggplot(dat_all, aes(x, y)) +
+  geom_raster(aes(fill = resistance), data = grad_data %>%
+                dplyr::mutate(x = x / 100, y = y / 100),
+              alpha = 0.5) +
+  geom_point(aes(colour = sex)) +
+  scale_fill_viridis_c() +
+  scale_colour_manual(values = c("red", "orange")) +
+  coord_equal() +
+  transition_time(generation) +
+  theme_minimal()
+
+animate(anim_spat_comp, nframes = 1000, fps = 30)
+
+
+coords <- slim_outputFull_extract(spat_comp_run$output_data %>%
+                                    filter(name == "full_output"), 
+                                  "coordinates")
+
+new_spat_gl <- slim_output_genlight(spat_comp_run$output_data %>%
+                                      filter(name == "full_output"))
+plot(new_spat_gl)
+
+new_gen_diff <- dist(new_spat_gl, "manhattan")
+
+new_gen_clust <- hclust(new_gen_diff)
+plot(as.dendrogram(new_gen_clust) %>% 
+       set("branches_k_color", k = 12),
+     leaflab = "none")
+
+new_gen_cut <- cutree(new_gen_clust, k = 12)
+
+dat_join <- coords %>%
+  left_join(tibble(unique_ind_id = names(new_gen_cut),
+                   cluster = as.factor(new_gen_cut)))
+
+ggplot(dat_join, aes(x, y)) +
+  geom_raster(aes(fill = resistance), data = grad_data %>%
+                dplyr::mutate(x = x / 100, y = y / 100), 
+              alpha = 0.3) +
+  geom_point(aes(colour = cluster)) +
+  scale_fill_viridis_c() +
+  coord_equal() +
+  theme_minimal()
+
+costtrans <- transition(res_rast, function(x) mean(1 - x),
+                        directions = 8)
+locs <- coords %>%
+  dplyr::select(x, y) %>%
+  mutate(x = x * 100, y = y * 100) %>%
+  as.matrix()
+
+costdist <- commuteDistance(costtrans, locs) %>%
+  as.dist()
+geodist <- dist(locs)
+
+
+## some stats
+summary(lm(as.vector(new_gen_diff) ~ as.vector(costdist)))
+summary(lm(as.vector(new_gen_diff) ~ as.vector(geodist)))
+
+```
+
+
+```{r contrived_example}
+
+contrived_rast <- expand_grid(x = c(1:100), y = 1:100) %>%
+  mutate(central_mountain = dnorm(x - 50, sd = 20) * dnorm(y - 50, sd = 20),
+         east_west_line = dnorm(y - 50, sd = 10) * dunif(x, 5, 95),
+         south_north_line = dnorm(x - 50, sd = 10) * dunif(y, 5, 95)) %>%
+  mutate(central_mountain = central_mountain / max(central_mountain),
+         east_west_line = east_west_line / max(east_west_line),
+         south_north_line = south_north_line / max(south_north_line)) %>%
+  mutate(resistance = central_mountain + east_west_line + south_north_line)
+
+ggplot(contrived_rast, aes(x, y)) +
+  geom_raster(aes(fill = resistance)) +
+  scale_fill_viridis_c() +
+  theme_minimal()
+
+new_res_rast <- rasterFromXYZ(contrived_rast %>%
+                                dplyr::select(x, y, resistance))
+
+plot(new_res_rast)
+
+```
+
+Now we make the gradient for that:
+
+```{r convert_to_image2}
+landscape_im <- as.cimg(new_res_rast)
+plot(landscape_im)
+grad <- imgradient(landscape_im)
+## standardise gradient to a maximum norm of 1
+norms <- sqrt(grad[[1]]^2 + grad[[2]]^2)
+grad[[1]] <- round(grad[[1]] / max(norms), 3) 
+grad[[2]] <- round(grad[[2]] / max(norms), 3)
+plot(grad)
+
+grad_data <- expand_grid(x = 1:100, y = 1:100) %>%
+  mutate(x_grad = as.matrix(grad[[1]])[cbind(x, y)],
+         y_grad = as.matrix(grad[[2]])[cbind(x, y)],
+         resistance = as.matrix(landscape_im)[cbind(x, y)]) %>%
+  mutate(resistance = resistance / max(resistance)) ## normalise
+
+ggplot(grad_data) + 
+  geom_raster(aes(x, y, fill = resistance), alpha = 0.6) +
+  geom_quiver(aes(x, y, u = x_grad, v = y_grad), vecsize = 2) +
+  scale_fill_viridis_c() +
+  coord_equal() +
+  theme_minimal()
+
+res_rast_c <- rasterFromXYZ(grad_data %>%
+                            dplyr::select(x, y, resistance))
+x_grad_rast_c <- rasterFromXYZ(grad_data %>%
+                               ## plus 1 is a hack to work around a SLiM bug
+                               mutate(x_grad = x_grad + 1) %>%
+                               dplyr::select(x, y, x_grad))
+y_grad_rast_c <- rasterFromXYZ(grad_data %>%
+                               mutate(y_grad = y_grad + 1) %>%
+                               dplyr::select(x, y, y_grad))
+```
+
+Now we can render our script with the above raster object names in place of the original ones.
+
+```{r new_script_again}
+new_spat_comp <- slimr_script_render(spat_comp,
+                                     template = list(res_rast_name = "res_rast_c",
+                                                     x_grad_rast_name = "x_grad_rast_c",
+                                                     y_grad_rast_name = "y_grad_rast_c"))
+
+new_spat_comp
+
+```
+
+Now to run it!
+
+```{r last_run}
+contrived_run <- slim_run(new_spat_comp)
+```
+
+So, without even looking at the any results, let's see what happens if we cluster our genomes into 4 genetic clusters and plot it. Do you think we will get four clusters, that colocate within each of the four low resistance 'patches' we created? Let's find out.
+
+```{r cluster_four}
+contrived_coords <- slim_outputFull_extract(contrived_run$output_data %>%
+                                    filter(name == "full_output"), 
+                                  "coordinates")
+
+contrived_gl <- slim_output_genlight(contrived_run$output_data %>%
+                                      filter(name == "full_output"))
+plot(contrived_gl)
+
+contrived_gen_diff <- dist(contrived_gl, "manhattan")
+
+contrived_gen_clust <- hclust(contrived_gen_diff)
+plot(as.dendrogram(contrived_gen_clust) %>% 
+       set("branches_k_color", k = 4),
+     leaflab = "none")
+
+contrived_gen_cut <- cutree(contrived_gen_clust, k = 4)
+
+contrived_dat_join <- contrived_coords %>%
+  left_join(tibble(unique_ind_id = names(contrived_gen_cut),
+                   cluster = as.factor(contrived_gen_cut)))
+
+ggplot(contrived_dat_join, aes(x, y)) +
+  geom_raster(aes(fill = resistance), data = grad_data %>%
+                dplyr::mutate(x = x / 100, y = y / 100), 
+              alpha = 0.3) +
+  geom_point(aes(colour = cluster)) +
+  scale_fill_viridis_c() +
+  coord_equal() +
+  theme_minimal()
+
+```
+
+Clearly, it is not quite as simple as we hoped. However, there is little obvious structure dictated by our contrived patched. We also can note very clearly that the resistance gradient is not having as big an effect as we were planning on movement. There are many individuals in the high resistance areas. This is likely a direct influence of competition. Though it is harder to move into high resistance areas, there is a fitness benefit from moving away from other individuals, so those that do make it in will have higher fecundity, which may compensate enough to allow just as many indivduals to move into the gradient as move out of it. This could be a realistic phenomenon for some systems, however, we often associate high resistance landscapes as some how unsuitable habitat for an organism, in which case, it would be more realistic to have fitness depend in some way on resistance as well. It is actually fairly simple to implement something like this. We just need to make our local carrying capacity, K, a function of resistance. We could for example, simply multiply K by (1 - resistance). Let's try this!
+
+```{r fitness_res}
+spat_comp_fitness <- slim_script(
+  
+  slim_function("float x_grad", "float y_grad",
+                "float resistance", "float range",
+                "float noise_strength",
+                name = "calc_trajectory",
+                return_type = "float",
+                body = calc_trajectory),
+  
+  slim_block(initialize(), {
+    setSeed(!!seed);
+    ## initialize non-WrightFisher model
+    initializeSLiMModelType("nonWF");
+    ## initialize a spatial model
+    initializeSLiMOptions(dimensionality = "xy");
+    initializeMutationRate(1e-07);
+    initializeMutationType("m1", 0.5, "f", 0);
+    initializeGenomicElementType("g1", m1, 1);
+    initializeGenomicElement(g1, 0, 1e+05 - 1);
+    initializeRecombinationRate(1e-08);
+    ## add sexual reproduction ("A" mean autosomal (no sex
+    ## chromosomes))
+    initializeSex("A");
+    ## initialise a spatial interaction (for finding mates)
+    initializeInteractionType("i1", "xy", 
+                              reciprocal = T, 
+                              maxDistance = 0.02)
+    i1.setInteractionFunction("f", 1.0) ## simplest is 1 or 0
+    ## spatial competition interaction
+    initializeInteractionType("i2", "xy", 
+                              reciprocal = T, 
+                              maxDistance = slimr_template("comp_dist", 0.06) * 3);
+    i2.setInteractionFunction("n", 1.0, ..comp_dist..);
+  }),
+  
+  slim_block(reproduction(NULL, "F"), { ## only run on females
+    ## find all males within maximum mating distance
+    possible_mates = subpop.individuals[i1.strength(individual) == 1.0]
+    possible_mates = possible_mates[possible_mates.sex == "M"]
+    ## choose a mate
+    if(size(possible_mates)) { ## returns FALSE if zero length
+      mate = sample(possible_mates, 1);
+    } else {
+      mate = integer(0);
+    }
+    
+    for(i in seqLen(rpois(1, slimr_template("fecundity", 2.5)))) {
+      if(size(mate)) {
+        ## add outcrossed child to population
+        child = subpop.addCrossed(individual, mate);
+        ## set offspring position
+        child.setSpatialPosition(individual.spatialPosition)
+      }
+    }
+  }),
+  
+  slim_block(1, early(), {
+    sim.addSubpop("p1", slimr_template("N", 100))
+    p1.setSpatialBounds(c(0, 0, 1, 1))
+    ## start everyone in bottom-left corner
+    p1.individuals.setSpatialPosition(runif(2 * ..N.., 0, 0.25))
+    p1.defineSpatialMap("resistance", spatiality = "xy",
+                        values = slimr_inline(slimr_template("res_rast_name", "res_rast", unquote_strings = TRUE), delay = TRUE),
+                        interpolate = T)
+    p1.defineSpatialMap("x_grad", spatiality = "xy",
+                        values = slimr_inline(slimr_template("x_grad_rast_name", "x_grad_rast", unquote_strings = TRUE), delay = TRUE),
+                        interpolate = T,
+                        valueRange = c(-1, 1),
+                        colors = c("blue", "red"))
+    p1.defineSpatialMap("y_grad", spatiality = "xy",
+                        values = slimr_inline(slimr_template("y_grad_rast_name", "y_grad_rast", unquote_strings = TRUE), delay = TRUE),
+                        interpolate = T)
+    ## also evaluate interaction for the first time, ready for the late()
+    ## block
+    # i1.evaluate(p1)
+    # i2.evaluate(p1)
+  }),
+  
+  slim_block(1, .., early(), {
+
+    ## evaluate spatial interaction (this just updates it basically)
+    i2.evaluate()
+    
+    inds = p1.individuals;
+    
+    ## HERE IS THE CHANGE!!:
+    location = inds.spatialPosition
+  	resistance = p1.spatialMapValue("resistance", location)
+  	K = slimr_template("K", 500) * (1 - resistance)
+  	K = K + 1 ## minimum local carrying capacity
+  	
+    competition = i2.totalOfNeighborStrengths(inds)
+    ## basically Lotka-Volterra competition (locally)
+    ## the second part of the equation standardises by the area of a circle
+    ## the + 1 adds the influence of an individual on itself
+    competition = (competition + 1) / (2 * PI * ..comp_dist..^2)
+    inds.fitnessScaling = K / competition
+  }),
+  
+  slim_block(1, .., late(), {
+    ## evaluate spatial interactions (this just updates it basically)
+  	i1.evaluate(p1)
+    #i2.evaluate(p1)
+    
+    inds = sim.subpopulations.individuals
+  	location = inds.spatialPosition
+  	resistance = p1.spatialMapValue("resistance", location)
+  	x_grad = p1.spatialMapValue("x_grad", location)
+  	y_grad = p1.spatialMapValue("y_grad", location)
+  	trajectories = calc_trajectory(x_grad, y_grad, resistance, 
+  	                               slimr_template("range", 0.05),
+  	                               0.1)
+  	inds.setSpatialPosition(p1.pointReflected(location + trajectories))
+  }),
+  
+  slim_block(1, 1000, late(), {
+    ## do_every parameter says to only
+    ## output every 5 generations
+    slimr_output_coords("xy", do_every = 1)
+    slimr_output_sex(do_every = 1)
+  }),
+  
+  slim_block(1000, late(), {
+    slimr_output_full()
+  })
+  
+)
+
+spat_comp_fitness
+```
+
+Try it!
+
+```{r last_run_really_this_time}
+new_spat_comp_fitness <- slimr_script_render(spat_comp_fitness,
+                                     template = list(res_rast_name = "res_rast_c",
+                                                     x_grad_rast_name = "x_grad_rast_c",
+                                                     y_grad_rast_name = "y_grad_rast_c"))
+
+new_spat_comp_fitness
+
+spat_comp_fitness_run <- slim_run(new_spat_comp_fitness)
+
+contrived_coords <- slim_outputFull_extract(spat_comp_fitness_run$output_data %>%
+                                    filter(name == "full_output"), 
+                                  "coordinates")
+
+contrived_gl <- slim_output_genlight(spat_comp_fitness_run$output_data %>%
+                                      filter(name == "full_output"))
+plot(contrived_gl)
+
+contrived_gen_diff <- dist(contrived_gl, "manhattan")
+
+contrived_gen_clust <- hclust(contrived_gen_diff)
+plot(as.dendrogram(contrived_gen_clust) %>% 
+       set("branches_k_color", k = 12),
+     leaflab = "none")
+
+contrived_gen_cut <- cutree(contrived_gen_clust, k = 12)
+
+contrived_dat_join <- contrived_coords %>%
+  left_join(tibble(unique_ind_id = names(contrived_gen_cut),
+                   cluster = as.factor(contrived_gen_cut)))
+
+ggplot(contrived_dat_join, aes(x, y)) +
+  geom_raster(aes(fill = resistance), data = grad_data %>%
+                dplyr::mutate(x = x / 100, y = y / 100), 
+              alpha = 0.3) +
+  geom_point(aes(colour = cluster)) +
+  scale_fill_viridis_c() +
+  coord_equal() +
+  theme_minimal()
+
+```
+
+```{r animate_it_again, cache=TRUE, cache.extra=seed}
+coord_sex <- slim_results_to_data(spat_comp_fitness_run$output_data %>%
+                                    filter(name != "full_output"))
+
+sex_all <- coord_sex %>%
+  filter(name == "sex") %>%
+  dplyr::select(generation, data) %>%
+  unnest_longer(col = data, 
+                values_to = "sex",
+                indices_include = TRUE)
+  
+coords_all <- coord_sex %>%
+  filter(name %in% c("x", "y")) %>%
+  dplyr::select(generation, name, data) %>%
+  unnest_longer(col = data, 
+                values_to = "coordinate",
+                indices_include = TRUE) %>%
+  pivot_wider(names_from = name, values_from = coordinate)
+
+dat_all <- coords_all %>%
+  left_join(sex_all) %>%
+  mutate(x = as.numeric(x),
+         y = as.numeric(y))
+
+dat_all
+
+anim_spat_comp <- ggplot(dat_all %>%
+                           filter(generation <= 200), aes(x, y)) +
+  geom_raster(aes(fill = resistance), data = grad_data %>%
+                dplyr::mutate(x = x / 100, y = y / 100),
+              alpha = 0.5) +
+  geom_point(aes(colour = sex)) +
+  scale_fill_viridis_c() +
+  scale_colour_manual(values = c("red", "orange")) +
+  coord_equal() +
+  transition_time(generation) +
+  theme_minimal()
+
+animate(anim_spat_comp, nframes = 200, fps = 10)
+
+```
+
+This finally looks like what we are expecting!
+
+## Approximate Bayesian Computation (ABC)
+
+Here we will do a simple example of Approximate Bayesian Computation, which is a set of methods for fitting simulation output to observational data. It is part of a larger class of methods known as Likelihood-free Inference. We will use the `EasyABC` package in R for this. First we will try a very basic example, which is based on an example from the SLiM manual. Let's setup our simulation model and then write a little wrapper function that can be passed to `EasyABC`.
+
+```{r ABC_1}
+library(EasyABC)
+
+simple_sim <- slim_script(
+  slim_block(initialize(), {
+    setSeed(slimr_template("seed", 123456))
+    initializeMutationRate(slimr_template("mu", 1e-7));
+    initializeMutationType("m1", 0.5, "f", 0.0);
+    initializeGenomicElementType("g1", m1, 1.0);
+    initializeGenomicElement(g1, 0, 999999);
+    initializeRecombinationRate(1e-8);
+  }),
+  slim_block(1, {
+    sim.addSubpop("p1", 100)
+  }),
+  slim_block(1000, late(), {
+    slimr_output(sim.mutations.size(), "n_mut")
+  })
+)
+
+## EasyABC wants a function which takes a single vector of parameters
+## The first element is always the seed, which is required for reproducibility
+## when running in parallel
+run_mod <- function(x) {
+  scrpt <- slimr_script_render(simple_sim, template = list(mu = x[2],
+                                                           seed = x[1]))
+  run <- suppressMessages(slim_run(scrpt, progress = FALSE))
+  as.numeric(run$output_data$data)
+}
+
+## try it with mutation rate of 1e-7
+test_value <- run_mod(c(123, 1e-7))
+test_value
+
+```
+
+This is obviously a pretty trivial model. It runs a neutral evolution simulation on a single population of 100 individuals for a particular mutation rate, and return how many mutations there are in the population after 1000 generations. We will run ABC on this to see if we can recover the mutation rate by just feeding the algorithm the expected number of mutation at generation 1000. This is how that works:
+
+```{r easy_ABC_trivial, cache=TRUE, cache.extra=seed}
+ABC_test <- ABC_sequential(method = "Lenormand", model = run_mod,
+                           prior = list(c("unif", 1e-9, 1e-6)),
+                           summary_stat_target = test_value,
+                           nb_simul = 1000,
+                           use_seed = TRUE,
+                           progress_bar = interactive())
+```
+
+We used a prior for ABC that encompassed what we might consider a "realistic" range of values for the system (in this case, we can pretty much make that up, since we have no real system in mind).
+
+This is the result:
+
+```{r abc_results}
+sum(ABC_test$param * ABC_test$weights)
+cat(format(sum(ABC_test$param * ABC_test$weights), scientific = TRUE))
+
+ggplot(tibble(mu = ABC_test$param), aes(mu)) +
+  geom_histogram() +
+  geom_vline(xintercept = 1e-7) +
+  scale_x_log10() +
+  theme_minimal()
+```
+
+Our ABC estimate appears to be a bit of an underestimate, but the true value of our original simulation is well within the posterior distribution of our ABC sample. So that is good.
+
+
+
+
