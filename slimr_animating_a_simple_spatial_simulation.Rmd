@@ -1,0 +1,106 @@
+---
+title: "Animating a Simple Spatial Simulation using slimr"
+author: "Russell Dinnage"
+date: "24/08/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, comment = "",
+                      error = TRUE,
+                      fig.width = 7,
+                      fig.height = 6,
+                      out.width = "80%")
+```
+
+```{r color, echo = FALSE, results='asis'}
+# crayon needs to be explicitly activated in Rmd
+options(crayon.enabled = TRUE)
+# Hooks needs to be set to deal with outputs
+# thanks to fansi logic
+if(requireNamespace("fansi", quietly = TRUE)) {
+  old_hooks <- fansi::set_knit_hooks(knitr::knit_hooks, 
+                                     which = c("output", "message", "error"))
+}
+```
+
+
+Let's set up a minimal spatial simulation using `slimr`. We will use it to demonstrate making animation of results in `gganimate`
+
+```{r load_packages, results='hide', message=FALSE, warning=FALSE}
+library(slimr)
+library(gganimate)
+```
+
+```{r setup_sim}
+N <- 100
+
+## minimal spatial sim
+spat_sim <- slim_script(
+  
+  slim_block(initialize(), {
+    initializeSLiMOptions(dimensionality = "xy")
+    initializeMutationRate(1e-7)
+    initializeMutationType("m1", 0.5, "f", 0.0)
+    initializeGenomicElementType("g1", m1, 1.0)
+    initializeGenomicElement(g1, 0, 100000 - 1)
+    initializeRecombinationRate(1e-8)
+  }),
+  
+  slim_block(1, early(), {
+    sim.addSubpop("p1", !!N)
+    sim.addSubpop("p2", !!N)
+    p1.setSpatialBounds(c(0, 0, 1, 1))
+    p2.setSpatialBounds(c(0, 0, 1, 1))
+    p1.individuals.setSpatialPosition(p1.pointUniform(!!N))
+    p2.individuals.setSpatialPosition(p2.pointUniform(!!N))
+  }),
+  
+  slim_block(1, 1000, late(), {
+    inds = sim.subpopulations.individuals
+  	location = inds.spatialPosition
+  	## move around a bit
+  	inds.setSpatialPosition(p1.pointReflected(sim.subpopulations.individuals.spatialPosition +
+  	                                            rnorm(inds.size() * 2, 0, 0.01)))
+  	slimr_output_full()
+  }),
+  
+  slim_block(modifyChild(), {
+    
+    child.setSpatialPosition(parent1.spatialPosition)
+    return(T)
+    
+  })
+  
+)
+
+spat_sim
+```
+
+Run that simulation with `slim_run`.
+
+```{r run_sim}
+spat_run <- slim_run(spat_sim)
+```
+
+Now we can easily extract coordinates:
+
+```{r extract_coords}
+coords <- slim_extract_full(spat_run$output_data, "coordinates")
+coords
+```
+
+Animate it!
+
+```{r animate_it}
+anim <- ggplot(coords, aes(x, y)) +
+  geom_point(aes(colour = pop_id)) +
+  scale_fill_viridis_c() +
+  coord_equal() +
+  transition_time(generation) +
+  shadow_wake(wake_length = 0.01,
+              alpha = 0.5) +
+  theme_minimal()
+
+animate(anim, nframes = 1000, fps = 30)
+```
